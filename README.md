@@ -48,6 +48,36 @@ Or provide a one-time MFA code directly:
 OPENCONNECT_MFA_CODE=<Multi factor authentication code>
 ```
 
+`OPENCONNECT_MFA_FORMAT` controls how the password and MFA code are submitted:
+
+- `separate` (default when unset or empty): send the password and code on two separate lines.
+- `comma`: send `password,123456` on a single line, for GlobalProtect gateways that accept combined password-and-OTP authentication.
+
+Other values are rejected at startup. The format applies only when both a password
+and an MFA code are available; password-only, interactive, and cookie authentication
+keep their existing behavior. An explicit `OPENCONNECT_MFA_CODE` takes precedence
+over `OPENCONNECT_TOTP_SECRET`. Otherwise, a new TOTP code is generated on every
+connection attempt, including retries.
+
+Example for a gateway configured to accept combined password-and-OTP input:
+
+```ini
+OPENCONNECT_URL=https://duo.vpn.sdsu.edu/gateway
+OPENCONNECT_USER=your_username
+OPENCONNECT_PASSWORD=your_password
+OPENCONNECT_TOTP_SECRET=YOUR_BASE32_SECRET
+OPENCONNECT_MFA_FORMAT=comma
+OPENCONNECT_OPTIONS=--protocol=gp
+MAX_RECONNECT_ATTEMPTS=1
+```
+
+The TOTP secret must correspond to an authentication method accepted by the VPN
+server for your account. HOTP and TOTP are different methods and are not
+interchangeable; an HOTP token secret does not automatically work with
+`OPENCONNECT_TOTP_SECRET`. Confirm the server's supported method and input format
+with your VPN administrator. Keep passwords, OTP secrets, tokens, and `.env` files
+out of version control.
+
 Automatic reconnects are unlimited by default. To cap them, set the maximum
 number of retries allowed after the initial connection attempt:
 
