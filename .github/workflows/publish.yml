@@ -127,7 +127,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: wazum/openconnect-proxy
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/openconnect-proxy
           flavor: |
             latest=auto
           tags: |
