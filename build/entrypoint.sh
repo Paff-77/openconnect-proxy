@@ -5,6 +5,15 @@ SOCKS_PORT="${SOCKS_PORT:-8889}"
 RECONNECT_DELAY="${RECONNECT_DELAY:-60}"
 MAX_RECONNECT_ATTEMPTS="${MAX_RECONNECT_ATTEMPTS:-0}"
 TUNNEL_GATE="${TUNNEL_GATE:-1}"
+OPENCONNECT_MFA_FORMAT="${OPENCONNECT_MFA_FORMAT:-separate}"
+
+case "$OPENCONNECT_MFA_FORMAT" in
+  separate|comma) ;;
+  *)
+    printf '%s\n' 'FATAL: OPENCONNECT_MFA_FORMAT must be separate or comma' >&2
+    exit 1
+    ;;
+esac
 
 validate_reconnect_settings() {
   case "$MAX_RECONNECT_ATTEMPTS" in
@@ -112,7 +121,11 @@ run () {
     eval "openconnect ${ALL_OPTIONS} -u \"${OPENCONNECT_USER}\" \"${OPENCONNECT_URL}\""
   elif [ -n "$OPENCONNECT_MFA_CODE" ]; then
     echo "Password and MFA detected. Starting OpenConnect with both."
-    (echo "$OPENCONNECT_PASSWORD"; echo "$OPENCONNECT_MFA_CODE") | \
+    if [ "${OPENCONNECT_MFA_FORMAT:-separate}" = "comma" ]; then
+      printf '%s,%s\n' "$OPENCONNECT_PASSWORD" "$OPENCONNECT_MFA_CODE"
+    else
+      printf '%s\n%s\n' "$OPENCONNECT_PASSWORD" "$OPENCONNECT_MFA_CODE"
+    fi | \
     eval "openconnect ${ALL_OPTIONS} -u \"${OPENCONNECT_USER}\" --passwd-on-stdin \"${OPENCONNECT_URL}\""
   elif [ -n "$OPENCONNECT_PASSWORD" ]; then
     echo "Password detected. Starting OpenConnect."

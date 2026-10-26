@@ -26,6 +26,7 @@ MOCK
   # Extract the run() function from entrypoint.sh, renamed to vpn_run to avoid
   # conflicting with BATS's built-in run command
   eval "$(sed -n '/^run () {/,/^}/p' "$PROJECT_ROOT/build/entrypoint.sh" | sed 's/^run ()/vpn_run()/')"
+  eval "$(sed -n '/^run_with_retries()/,/^}/p' "$PROJECT_ROOT/build/entrypoint.sh")"
 
   cat > "$MOCK_DIR/jq" << 'MOCK'
 #!/bin/sh
@@ -39,6 +40,7 @@ MOCK
   export OPENCONNECT_URL="vpn.example.com"
   unset OPENCONNECT_PASSWORD
   unset OPENCONNECT_MFA_CODE
+  unset OPENCONNECT_MFA_FORMAT
   unset OPENCONNECT_OPTIONS
   unset OPENCONNECT_COOKIE
   unset OPENCONNECT_COOKIE_FILE
@@ -61,6 +63,14 @@ MOCK
 
 teardown() {
   rm -rf "$MOCK_DIR"
+}
+
+# Compare bytes, including the final newline, rather than trimming stdin with
+# command substitution.
+assert_stdin_equals() {
+  printf '%s\n' "$1" > "$MOCK_DIR/expected_stdin"
+  run cmp "$MOCK_DIR/expected_stdin" "$MOCK_STDIN_FILE"
+  assert_success
 }
 
 # --- Password modes ---
@@ -88,7 +98,7 @@ teardown() {
   assert_equal "$stdin_content" "secret123"
 }
 
-@test "MFA mode pipes password and MFA code" {
+@test "default MFA format pipes password and MFA code on separate lines" {
   export OPENCONNECT_PASSWORD="secret123"
   export OPENCONNECT_MFA_CODE="654321"
 
@@ -99,9 +109,85 @@ teardown() {
   args="$(cat "$MOCK_ARGS_FILE")"
   assert_equal "$args" "-u testuser --passwd-on-stdin vpn.example.com"
 
-  stdin_content="$(cat "$MOCK_STDIN_FILE")"
   expected="$(printf 'secret123\n654321')"
-  assert_equal "$stdin_content" "$expected"
+  assert_stdin_equals "$expected"
+}
+
+@test "explicit separate MFA format preserves two-line input" {
+  export OPENCONNECT_PASSWORD="secret123"
+  export OPENCONNECT_MFA_CODE="654321"
+  export OPENCONNECT_MFA_FORMAT="separate"
+
+  run vpn_run
+  assert_success
+  assert_stdin_equals "$(printf 'secret123\n654321')"
+}
+
+@test "comma MFA format sends exactly password,654321 on one line" {
+  export OPENCONNECT_PASSWORD="password"
+  export OPENCONNECT_MFA_CODE="654321"
+  export OPENCONNECT_MFA_FORMAT="comma"
+  export OPENCONNECT_OPTIONS="--protocol=gp"
+
+  run vpn_run
+  assert_success
+  refute_output --partial "$OPENCONNECT_PASSWORD"
+  refute_output --partial "$OPENCONNECT_MFA_CODE"
+  assert_equal "$(cat "$MOCK_ARGS_FILE")" "--protocol=gp -u testuser --passwd-on-stdin vpn.example.com"
+  assert_stdin_equals "password,654321"
+}
+
+@test "MFA formats preserve special characters in passwords" {
+  export OPENCONNECT_PASSWORD='-n\c p@ss\word %s "quoted" $HOME $(literal) `literal` * ; & | ,'
+  export OPENCONNECT_MFA_CODE="654321"
+
+  for format in separate comma; do
+    export OPENCONNECT_MFA_FORMAT="$format"
+    run vpn_run
+    assert_success
+    refute_output --partial "$OPENCONNECT_PASSWORD"
+    refute_output --partial "$OPENCONNECT_MFA_CODE"
+
+    if [ "$format" = "comma" ]; then
+      assert_stdin_equals "$OPENCONNECT_PASSWORD,654321"
+    else
+      assert_stdin_equals "$OPENCONNECT_PASSWORD
+654321"
+    fi
+  done
+}
+
+@test "comma MFA format preserves password-only mode" {
+  export OPENCONNECT_PASSWORD="secret123"
+  export OPENCONNECT_MFA_FORMAT="comma"
+
+  run vpn_run
+  assert_success
+  assert_output --partial "Password detected. Starting OpenConnect."
+  assert_equal "$(cat "$MOCK_ARGS_FILE")" "-u testuser --passwd-on-stdin vpn.example.com"
+  assert_stdin_equals "secret123"
+}
+
+@test "comma MFA format preserves interactive password mode" {
+  export OPENCONNECT_MFA_FORMAT="comma"
+
+  run vpn_run
+  assert_success
+  assert_output --partial "Password not set. Prompting for password..."
+  assert_equal "$(cat "$MOCK_ARGS_FILE")" "-u testuser vpn.example.com"
+}
+
+@test "invalid MFA formats are rejected before starting OpenConnect" {
+  export OPENCONNECT_PASSWORD="secret123"
+  export OPENCONNECT_MFA_CODE="654321"
+
+  for format in invalid COMMA 'comma ' 'separate,comma'; do
+    run env OPENCONNECT_MFA_FORMAT="$format" sh "$PROJECT_ROOT/build/entrypoint.sh"
+    assert_failure 1
+    assert_output "FATAL: OPENCONNECT_MFA_FORMAT must be separate or comma"
+    [ ! -e "$MOCK_ARGS_FILE" ]
+    [ ! -e "$MOCK_STDIN_FILE" ]
+  done
 }
 
 # --- TOTP auto-generation ---
@@ -118,6 +204,64 @@ teardown() {
   stdin_content="$(cat "$MOCK_STDIN_FILE")"
   expected="$(printf 'secret123\n123451')"
   assert_equal "$stdin_content" "$expected"
+}
+
+@test "TOTP secret generates MFA code in comma format without logging credentials" {
+  export OPENCONNECT_PASSWORD="secret123"
+  export OPENCONNECT_TOTP_SECRET="JBSWY3DPEHPK3PXP"
+  export OPENCONNECT_MFA_FORMAT="comma"
+
+  run vpn_run
+  assert_success
+  assert_output --partial "TOTP code generated from secret."
+  refute_output --partial "$OPENCONNECT_PASSWORD"
+  refute_output --partial "$OPENCONNECT_TOTP_SECRET"
+  refute_output --partial "123451"
+  assert_stdin_equals "secret123,123451"
+}
+
+@test "comma TOTP is refreshed on retries in the same shell" {
+  export OPENCONNECT_PASSWORD="secret123"
+  export OPENCONNECT_TOTP_SECRET="JBSWY3DPEHPK3PXP"
+  export OPENCONNECT_MFA_FORMAT="comma"
+  export MAX_RECONNECT_ATTEMPTS=1
+  export RECONNECT_DELAY=0
+  export MOCK_ATTEMPT_FILE="$MOCK_DIR/attempts"
+  echo 0 > "$MOCK_ATTEMPT_FILE"
+
+  cat > "$MOCK_DIR/openconnect" << 'MOCK'
+#!/bin/sh
+attempt=$(cat "$MOCK_ATTEMPT_FILE")
+attempt=$((attempt + 1))
+printf '%s\n' "$attempt" > "$MOCK_ATTEMPT_FILE"
+cat > "$MOCK_STDIN_FILE.$attempt"
+[ "$attempt" -ge 2 ]
+MOCK
+
+  run run_with_retries vpn_run
+  assert_success
+  assert_equal "$(cat "$MOCK_ATTEMPT_FILE")" "2"
+  assert_equal "$(cat "$OATHTOOL_COUNTER_FILE")" "2"
+  refute_output --partial "$OPENCONNECT_PASSWORD"
+  refute_output --partial "$OPENCONNECT_TOTP_SECRET"
+  refute_output --partial "123451"
+  refute_output --partial "123452"
+
+  MOCK_STDIN_FILE="$MOCK_DIR/openconnect_stdin.1" assert_stdin_equals "secret123,123451"
+  MOCK_STDIN_FILE="$MOCK_DIR/openconnect_stdin.2" assert_stdin_equals "secret123,123452"
+}
+
+@test "explicit MFA code takes precedence over TOTP on every comma attempt" {
+  export OPENCONNECT_PASSWORD="secret123"
+  export OPENCONNECT_MFA_CODE="654321"
+  export OPENCONNECT_TOTP_SECRET="JBSWY3DPEHPK3PXP"
+  export OPENCONNECT_MFA_FORMAT="comma"
+
+  vpn_run >/dev/null
+  assert_stdin_equals "secret123,654321"
+  vpn_run >/dev/null
+  assert_stdin_equals "secret123,654321"
+  assert_equal "$(cat "$OATHTOOL_COUNTER_FILE")" "0"
 }
 
 @test "TOTP secret is regenerated on every run" {
@@ -210,6 +354,28 @@ teardown() {
   assert_success
   assert_output --partial "Cookie/token detected."
   refute_output --partial "Password detected."
+}
+
+@test "comma MFA format preserves cookie and cookie-file authentication" {
+  export OPENCONNECT_COOKIE="webvpn=PRIORITY"
+  export OPENCONNECT_PASSWORD="secret123"
+  export OPENCONNECT_MFA_CODE="654321"
+  export OPENCONNECT_MFA_FORMAT="comma"
+
+  run vpn_run
+  assert_success
+  assert_output --partial "Cookie/token detected."
+  assert_equal "$(cat "$MOCK_ARGS_FILE")" "--cookie-on-stdin vpn.example.com"
+  assert_stdin_equals "webvpn=PRIORITY"
+
+  export OPENCONNECT_COOKIE_FILE="$MOCK_DIR/cookie.json"
+  printf '%s\n' '{"cookie": "webvpn=FROM_FILE_789"}' > "$OPENCONNECT_COOKIE_FILE"
+
+  run vpn_run
+  assert_success
+  assert_output --partial "Cookie/token detected."
+  assert_equal "$(cat "$MOCK_ARGS_FILE")" "--cookie-on-stdin vpn.example.com"
+  assert_stdin_equals "webvpn=FROM_FILE_789"
 }
 
 @test "cookie file is ignored when file does not exist" {
